@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hashtag Counter — last 24h</title>
+  <style>
+    :root { --bg:#0b1220; --card:#121a2b; --text:#e8eefb; --muted:#9fb0ce; --accent:#7aa2ff; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    .wrap { max-width: 820px; margin: 32px auto; padding: 0 16px; }
+    .card {
+      background: var(--card);
+      border-radius: 16px; padding: 18px; box-shadow: 0 6px 18px rgba(0,0,0,.24);
+      border: 1px solid rgba(255,255,255,.06);
+    }
+    h1 { margin: 0 0 8px; font-size: 20px; }
+    p.muted { color: var(--muted); margin-top: 6px; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items: center; }
+    input[type="text"] {
+      background: #0e1626; border: 1px solid rgba(255,255,255,.12); color: var(--text);
+      border-radius: 12px; padding: 10px 12px; min-width: 220px; outline: none;
+    }
+    label { color: var(--muted); display:flex; align-items:center; gap:6px; }
+    button {
+      background: var(--accent); color: #0b1220; border: 0; border-radius: 12px;
+      padding: 10px 14px; font-weight: 700; cursor: pointer;
+    }
+    .metric {
+      display:flex; align-items: baseline; gap: 10px; margin-top: 12px;
+    }
+    .metric .value { font-size: 44px; font-weight: 800; letter-spacing: -0.5px; }
+    .metric .label { color: var(--muted); }
+    .status { color: var(--muted); margin-top: 6px; min-height: 1.2em; }
+    canvas { width: 100%; height: 160px; display: block; }
+    .footer { color: var(--muted); text-align:center; margin-top: 18px; font-size: 12px; }
+    .badge { background:#0e1626; border:1px solid rgba(255,255,255,.12); padding:2px 8px; border-radius:999px; font-size:12px; color:var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Hashtag Counter — last 24h</h1>
+      <p class="muted">Counts posts using X/Twitter’s <span class="badge">recent counts</span> endpoint over the last 24 hours.</p>
+
+      <div class="row" style="margin-top:12px">
+        <input id="q" type="text" value="#zec" autocomplete="off" />
+        <label title="Exclude retweets from the count">
+          <input id="noRT" type="checkbox" />
+          Exclude retweets
+        </label>
+        <button id="go">Refresh</button>
+        <span class="badge" id="updated">—</span>
+      </div>
+
+      <div class="metric">
+        <div class="value" id="total">—</div>
+        <div class="label">mentions in the past 24h</div>
+      </div>
+      <div class="status" id="status"></div>
+
+      <div style="margin-top:10px">
+        <canvas id="chart" width="800" height="160" aria-label="Hourly sparkline"></canvas>
+      </div>
+    </div>
+
+    <div class="footer">
+      Edit the query and press Refresh. Examples: <code>#zec</code>, <code>$ZEC</code>, <code>#zec OR $ZEC</code>.
+    </div>
+  </div>
+
+  <script>
+    const els = {
+      q: document.getElementById('q'),
+      noRT: document.getElementById('noRT'),
+      go: document.getElementById('go'),
+      total: document.getElementById('total'),
+      status: document.getElementById('status'),
+      updated: document.getElementById('updated'),
+      canvas: document.getElementById('chart'),
+    };
+
+    let timer = null;
+
+    async function fetchCounts() {
+      const query = els.q.value.trim();
+      if (!query) return;
+
+      const params = new URLSearchParams({
+        q: query,
+        retweets: els.noRT.checked ? '0' : '1',
+        granularity: 'hour'
+      });
+
+      els.status.textContent = 'Loading…';
+      try {
+        const r = await fetch(`/api/x-count?${params}`);
+        const j = await r.json();
+
+        if (!r.ok) {
+          els.total.textContent = '—';
+          els.status.textContent = j?.error ? `Error: ${j.error}` : `HTTP ${r.status}`;
+          renderSparkline([]);
+          return;
+        }
+
+        // Show total and status
+        els.total.textContent = (typeof j.total === 'number') ? j.total.toLocaleString() : '—';
+
+        const rl = j?.rate_limit;
+        const rlStr = rl ? `Rate limit: ${rl.remaining ?? '?'} / ${rl.limit ?? '?'}, reset @ ${rl.reset ?? '?'}` : '';
+        const note = j?.note ? ` (${j.note})` : '';
+        els.status.textContent = `${new Date(j.end_time).toLocaleString()} — ${rlStr}${note}`;
+        els.updated.textContent = 'Updated: ' + new Date().toLocaleTimeString();
+
+        // Render hourly sparkline
+        renderSparkline(j?.per || []);
+      } catch (e) {
+        els.total.textContent = '—';
+        els.status.textContent = 'Network error.';
+        renderSparkline([]);
+      }
+    }
+
+    function renderSparkline(buckets) {
+      const ctx = els.canvas.getContext('2d');
+      const W = els.canvas.width = els.canvas.clientWidth;  // make canvas crisp on resize
+      const H = els.canvas.height = 160;
+
+      ctx.clearRect(0, 0, W, H);
+
+      if (!buckets.length) {
+        // axes baseline
+        ctx.globalAlpha = 0.4;
+        ctx.beginPath();
+        ctx.moveTo(0, H-24);
+        ctx.lineTo(W, H-24);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        return;
+      }
+
+      const counts = buckets.map(b => b.count || 0);
+      const max = Math.max(...counts, 1);
+      const padding = 8;
+      const xStep = (W - padding * 2) / Math.max(buckets.length - 1, 1);
+
+      // area fill
+      ctx.beginPath();
+      buckets.forEach((b, i) => {
+        const x = padding + i * xStep;
+        const y = map(counts[i], 0, max, H - 24, 16);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.lineTo(W - padding, H - 24);
+      ctx.lineTo(padding, H - 24);
+      ctx.closePath();
+      ctx.globalAlpha = 0.15;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      // line
+      ctx.beginPath();
+      buckets.forEach((b, i) => {
+        const x = padding + i * xStep;
+        const y = map(counts[i], 0, max, H - 24, 16);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // y-axis labels (min/max)
+      ctx.globalAlpha = 0.6;
+      ctx.font = '12px system-ui, sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText(String(Math.round(max)), W - 8, 16 + 10);
+      ctx.fillText('0', W - 8, H - 24 + 10);
+      ctx.globalAlpha = 1;
+    }
+
+    function map(v, inMin, inMax, outMin, outMax) {
+      return outMin + (outMax - outMin) * ((v - inMin) / (inMax - inMin || 1));
+    }
+
+    // Wire up UI
+    els.go.addEventListener('click', fetchCounts);
+    els.q.addEventListener('keydown', (e) => { if (e.key === 'Enter') fetchCounts(); });
+
+    // Auto-refresh every 60s (and on load)
+    function startAuto() {
+      if (timer) clearInterval(timer);
+      timer = setInterval(fetchCounts, 60_000);
+    }
+    window.addEventListener('resize', () => renderSparkline([]) || fetchCounts());
+    fetchCounts();
+    startAuto();
+  </script>
+</body>
+</html>
