@@ -68,134 +68,86 @@
       Edit the query and press Refresh. Examples: <code>#zec</code>, <code>$ZEC</code>, <code>#zec OR $ZEC</code>.
     </div>
   </div>
+<script>
+  const els = {
+    q: document.getElementById('q'),
+    noRT: document.getElementById('noRT'),
+    go: document.getElementById('go'),
+    total: document.getElementById('total'),
+    status: document.getElementById('status'),
+    updated: document.getElementById('updated'),
+    canvas: document.getElementById('chart'),
+  };
 
-  <script>
-    const els = {
-      q: document.getElementById('q'),
-      noRT: document.getElementById('noRT'),
-      go: document.getElementById('go'),
-      total: document.getElementById('total'),
-      status: document.getElementById('status'),
-      updated: document.getElementById('updated'),
-      canvas: document.getElementById('chart'),
-    };
+  let nextTimer = null;
+  let lastGood = null; // keep last successful payload
 
-    let timer = null;
+  function scheduleNext(ms) {
+    if (nextTimer) clearTimeout(nextTimer);
+    nextTimer = setTimeout(fetchCounts, Math.max(ms, 1000));
+  }
 
-    async function fetchCounts() {
-      const query = els.q.value.trim();
-      if (!query) return;
+  async function fetchCounts() {
+    const query = els.q.value.trim();
+    if (!query) return;
 
-      const params = new URLSearchParams({
-        q: query,
-        retweets: els.noRT.checked ? '0' : '1',
-        granularity: 'hour'
-      });
+    const params = new URLSearchParams({
+      q: query,
+      retweets: els.noRT.checked ? '0' : '1',
+      granularity: 'hour'
+    });
 
-      els.status.textContent = 'Loading…';
-      try {
-        const r = await fetch(`/api/x-count?${params}`);
-        const j = await r.json();
+    els.status.textContent = 'Loading…';
+    try {
+      const r = await fetch(`/api/x-count?${params}`);
+      const j = await r.json();
 
-        if (!r.ok) {
-          els.total.textContent = '—';
-          els.status.textContent = j?.error ? `Error: ${j.error}` : `HTTP ${r.status}`;
-          renderSparkline([]);
-          return;
-        }
-
-        // Show total and status
-        els.total.textContent = (typeof j.total === 'number') ? j.total.toLocaleString() : '—';
-
-        const rl = j?.rate_limit;
-        const rlStr = rl ? `Rate limit: ${rl.remaining ?? '?'} / ${rl.limit ?? '?'}, reset @ ${rl.reset ?? '?'}` : '';
-        const note = j?.note ? ` (${j.note})` : '';
-        els.status.textContent = `${new Date(j.end_time).toLocaleString()} — ${rlStr}${note}`;
-        els.updated.textContent = 'Updated: ' + new Date().toLocaleTimeString();
-
-        // Render hourly sparkline
-        renderSparkline(j?.per || []);
-      } catch (e) {
-        els.total.textContent = '—';
-        els.status.textContent = 'Network error.';
-        renderSparkline([]);
-      }
-    }
-
-    function renderSparkline(buckets) {
-      const ctx = els.canvas.getContext('2d');
-      const W = els.canvas.width = els.canvas.clientWidth;  // make canvas crisp on resize
-      const H = els.canvas.height = 160;
-
-      ctx.clearRect(0, 0, W, H);
-
-      if (!buckets.length) {
-        // axes baseline
-        ctx.globalAlpha = 0.4;
-        ctx.beginPath();
-        ctx.moveTo(0, H-24);
-        ctx.lineTo(W, H-24);
-        ctx.stroke();
-        ctx.globalAlpha = 1;
+      if (!r.ok) {
+        els.status.textContent = j?.error ? `Error: ${j.error}` : `HTTP ${r.status}`;
+        // Try again in 5 minutes if unknown error
+        scheduleNext(5 * 60 * 1000);
         return;
       }
 
-      const counts = buckets.map(b => b.count || 0);
-      const max = Math.max(...counts, 1);
-      const padding = 8;
-      const xStep = (W - padding * 2) / Math.max(buckets.length - 1, 1);
+      // Handle rate limit: keep showing last known total and sleep until reset
+      if (j?.retry_after_ms !== undefined) {
+        if (lastGood?.total != null) els.total.textContent = lastGood.total.toLocaleString();
+        const resetAt = j.retry_at ? new Date(j.retry_at) : new Date(Date.now() + j.retry_after_ms);
+        els.status.textContent = `Rate-limited. Next refresh @ ${resetAt.toLocaleTimeString()}`;
+        scheduleNext((resetAt - new Date()) + 1500);
+        return;
+      }
 
-      // area fill
-      ctx.beginPath();
-      buckets.forEach((b, i) => {
-        const x = padding + i * xStep;
-        const y = map(counts[i], 0, max, H - 24, 16);
-        if (i === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      });
-      ctx.lineTo(W - padding, H - 24);
-      ctx.lineTo(padding, H - 24);
-      ctx.closePath();
-      ctx.globalAlpha = 0.15;
-      ctx.fill();
-      ctx.globalAlpha = 1;
+      // Success
+      lastGood = j;
+      els.total.textContent = (typeof j.total === 'number') ? j.total.toLocaleString() : '—';
+      const rl = j?.rate_limit;
+      const rlStr = rl ? `Rate limit: ${rl.remaining ?? '?'} / ${rl.limit ?? '?'}, reset @ ${rl.reset ?? '?'}` : '';
+      els.status.textContent = `${new Date(j.end_time).toLocaleString()} — ${rlStr}`;
+      els.updated.textContent = 'Updated: ' + new Date().toLocaleTimeString();
 
-      // line
-      ctx.beginPath();
-      buckets.forEach((b, i) => {
-        const x = padding + i * xStep;
-        const y = map(counts[i], 0, max, H - 24, 16);
-        if (i === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      });
-      ctx.lineWidth = 2;
-      ctx.stroke();
+      // Render sparkline (reuse your existing render function)
+      renderSparkline(j?.per || []);
 
-      // y-axis labels (min/max)
-      ctx.globalAlpha = 0.6;
-      ctx.font = '12px system-ui, sans-serif';
-      ctx.textAlign = 'right';
-      ctx.fillText(String(Math.round(max)), W - 8, 16 + 10);
-      ctx.fillText('0', W - 8, H - 24 + 10);
-      ctx.globalAlpha = 1;
+      // Adaptive schedule:
+      // - If we still have quota, check again in 60s.
+      // - If we're at 0 remaining, sleep until reset.
+      if (rl && Number(rl.remaining) === 0 && rl.reset) {
+        const resetEpoch = Number(rl.reset) * 1000;
+        scheduleNext((resetEpoch - Date.now()) + 1500);
+      } else {
+        scheduleNext(60 * 1000);
+      }
+    } catch (e) {
+      els.status.textContent = 'Network error.';
+      scheduleNext(90 * 1000);
     }
+  }
 
-    function map(v, inMin, inMax, outMin, outMax) {
-      return outMin + (outMax - outMin) * ((v - inMin) / (inMax - inMin || 1));
-    }
-
-    // Wire up UI
-    els.go.addEventListener('click', fetchCounts);
-    els.q.addEventListener('keydown', (e) => { if (e.key === 'Enter') fetchCounts(); });
-
-    // Auto-refresh every 60s (and on load)
-    function startAuto() {
-      if (timer) clearInterval(timer);
-      timer = setInterval(fetchCounts, 60_000);
-    }
-    window.addEventListener('resize', () => renderSparkline([]) || fetchCounts());
-    fetchCounts();
-    startAuto();
-  </script>
+  // wire up UI (reuse your existing renderSparkline/etc.)
+  els.go.addEventListener('click', fetchCounts);
+  els.q.addEventListener('keydown', (e) => { if (e.key === 'Enter') fetchCounts(); });
+  fetchCounts();
+</script>
 </body>
 </html>
