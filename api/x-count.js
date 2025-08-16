@@ -1,22 +1,7 @@
-// Counts hashtag (or any X/Twitter query) mentions in the last 24h.
-// Env: X_BEARER_TOKEN (X API v2 Bearer token)
-//
-// Deploy on Vercel:
-// - Put this file at /api/x-count.js
-// - Set Project → Settings → Environment Variables → X_BEARER_TOKEN
-//
-// Usage examples:
-//   /api/x-count?q=%23zec               (counts #zec, includes retweets)
-//   /api/x-count?q=%23zec&retweets=0    (exclude retweets)
-//   /api/x-count?q=%24ZEN               (cashtag)
-//   /api/x-count?q=%23zec%20OR%20%24ZEC (combined rule)
-//
-// Returns:
-//   { total, per: [{start,end,count}], rate_limit: {...}, ... }
-
-const BUFFER_MS = 30 * 1000;      // avoid "too recent" errors by ending a bit before now
-const CACHE_SECONDS = 60;          // CDN edge cache
-const GRANULARITY_DEFAULT = "hour";// "minute" | "hour" | "day"
+// api/x-count.js
+const BUFFER_MS = 30 * 1000;
+const CACHE_SECONDS = 900;           // 15 minutes at the edge to avoid rate hits
+const GRANULARITY_DEFAULT = "hour";
 
 module.exports = async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -24,18 +9,14 @@ module.exports = async function handler(req, res) {
 
   try {
     const { q, granularity = GRANULARITY_DEFAULT, retweets = "1" } = req.query || {};
-    if (!q) {
-      return res.status(400).json({ error: "Missing ?q= query (e.g., %23zec for #zec)" });
-    }
+    if (!q) return res.status(400).json({ error: "Missing ?q=" });
 
     const token = process.env.X_BEARER_TOKEN;
-    if (!token) {
-      return res.status(500).json({ error: "Server not configured: missing X_BEARER_TOKEN env" });
-    }
+    if (!token) return res.status(500).json({ error: "Missing X_BEARER_TOKEN env" });
 
     const now = Date.now();
     const end = new Date(now - BUFFER_MS);
-    const start = new Date(end.getTime() - 24 * 60 * 60 * 1000); // last 24h
+    const start = new Date(end.getTime() - 24 * 60 * 60 * 1000);
 
     let xQuery = q;
     if (retweets === "0") xQuery += " -is:retweet";
@@ -56,16 +37,20 @@ module.exports = async function handler(req, res) {
       reset: r.headers.get("x-rate-limit-reset"),
     };
 
+    // If rate-limited, tell client exactly when to retry
     if (r.status === 429) {
+      const resetEpoch = Number(rate.reset);
+      const retryAt = isFinite(resetEpoch) ? new Date(resetEpoch * 1000) : new Date(Date.now() + 15 * 60 * 1000);
+      const retryAfterSec = Math.max(1, Math.ceil((retryAt - new Date()) / 1000));
+      res.setHeader("Retry-After", String(retryAfterSec));
       return res.status(200).json({
-        query: q,
-        evaluated_query: xQuery,
-        start_time: start.toISOString(),
-        end_time: end.toISOString(),
-        total: null,
-        per: [],
+        query: q, evaluated_query: xQuery,
+        start_time: start.toISOString(), end_time: end.toISOString(),
+        total: null, per: [],
         note: "Rate-limited by X; retry after reset.",
         rate_limit: rate,
+        retry_at: retryAt.toISOString(),
+        retry_after_ms: Math.max(0, retryAt - new Date()),
       });
     }
 
@@ -75,26 +60,15 @@ module.exports = async function handler(req, res) {
     }
 
     const data = await r.json();
-    const per = (data?.data || []).map(d => ({
-      start: d.start,
-      end: d.end,
-      count: d.tweet_count,
-    }));
-
-    const total =
-      (data?.meta && typeof data.meta.total_tweet_count === "number")
-        ? data.meta.total_tweet_count
-        : per.reduce((sum, b) => sum + (b.count || 0), 0);
+    const per = (data?.data || []).map(d => ({ start: d.start, end: d.end, count: d.tweet_count }));
+    const total = (data?.meta && typeof data.meta.total_tweet_count === "number")
+      ? data.meta.total_tweet_count
+      : per.reduce((s, b) => s + (b.count || 0), 0);
 
     return res.status(200).json({
-      query: q,
-      evaluated_query: xQuery,
-      start_time: start.toISOString(),
-      end_time: end.toISOString(),
-      total,
-      granularity,
-      per,
-      rate_limit: rate,
+      query: q, evaluated_query: xQuery,
+      start_time: start.toISOString(), end_time: end.toISOString(),
+      total, granularity, per, rate_limit: rate,
     });
   } catch (err) {
     return res.status(500).json({ error: String(err?.message || err) });
