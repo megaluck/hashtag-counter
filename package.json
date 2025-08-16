@@ -1,0 +1,8 @@
+{
+  "name": "hashtag-counter",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@vercel/kv": "^1.0.0"
+  }
+}
